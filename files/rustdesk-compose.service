@@ -1,0 +1,32 @@
+[Unit]
+Description=RustDesk server (hbbs + hbbr in Docker Compose)
+Documentation=https://github.com/civisrom/rustdesk-server-setup
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/opt/rustdesk
+# Wait for the Docker daemon instead of a fixed sleep
+ExecStartPre=/bin/sh -c 'for i in 1 2 3 4 5 6 7 8 9 10; do docker info >/dev/null 2>&1 && exit 0; sleep 3; done; exit 1'
+ExecStartPre=/usr/bin/docker compose config -q
+# `up` pulls the digest-pinned image only when it is missing, so starts and
+# watchdog restarts do not query Docker Hub (anonymous pulls are rate-limited).
+ExecStart=/usr/bin/docker compose up -d --wait
+ExecReload=/usr/bin/docker compose up -d --force-recreate
+ExecStop=/usr/bin/docker compose down
+ExecStopPost=-/usr/bin/docker compose logs --tail=50
+Restart=on-failure
+RestartSec=30
+TimeoutStartSec=300
+TimeoutStopSec=120
+SyslogIdentifier=rustdesk-compose
+PrivateTmp=yes
+NoNewPrivileges=yes
+LimitNOFILE=65536
+LimitNPROC=512
+
+[Install]
+WantedBy=multi-user.target

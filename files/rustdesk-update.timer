@@ -1,0 +1,15 @@
+[Unit]
+Description=Weekly RustDesk server image update
+Documentation=https://github.com/civisrom/rustdesk-server-setup
+
+[Timer]
+# Sunday 04:00 local time, spread over up to an hour
+OnCalendar=Sun *-*-* 04:00:00
+RandomizedDelaySec=1h
+AccuracySec=5min
+# Run after boot if the machine was off at the scheduled time
+Persistent=true
+Unit=rustdesk-update.service
+
+[Install]
+WantedBy=timers.target

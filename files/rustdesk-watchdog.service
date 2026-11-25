@@ -1,0 +1,22 @@
+[Unit]
+Description=RustDesk server watchdog
+Documentation=https://github.com/civisrom/rustdesk-server-setup
+After=docker.service rustdesk-compose.service
+ConditionPathExists=/opt/rustdesk/docker-compose.yml
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/rustdesk-ctl watchdog
+TimeoutStartSec=600
+SyslogIdentifier=rustdesk-watchdog
+# Runs every few minutes: keep it cheap and keep healthy runs out of the journal
+Nice=10
+IOSchedulingClass=idle
+CPUQuota=20%
+MemoryMax=128M
+LogLevelMax=notice
+SyslogLevel=warning
+PrivateTmp=yes
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/opt/rustdesk

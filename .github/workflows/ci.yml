@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+
+      - name: Bash syntax and ShellCheck
+        run: |
+          bash -n rustdesk-ctl
+          bash -n tests/e2e.sh
+          shellcheck --severity=style rustdesk-ctl tests/e2e.sh
+
+      - name: Unit tests
+        run: python3 tests/test_rustdesk_ctl.py -v
+
+      - name: Docker Compose validation
+        run: docker compose -f files/docker-compose.yml config -q
+
+      - name: systemd unit validation
+        run: |
+          mkdir -p /tmp/units
+          cp files/*.service files/*.timer /tmp/units/
+          sed -i 's#/usr/local/sbin/rustdesk-ctl#/bin/true#' /tmp/units/*.service
+          systemd-analyze verify /tmp/units/*
+
+      - name: Security invariants
+        run: |
+          # The image stays digest-pinned and both daemons require the key.
+          ! grep -q 'rustdesk-server:latest' files/docker-compose.yml
+          [ "$(grep -c -- ' -k _$' files/docker-compose.yml)" -eq 2 ]
+          # No lock in the world-writable system lock directory.
+          ! grep -n '/run/lock' rustdesk-ctl files/*

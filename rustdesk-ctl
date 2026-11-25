@@ -1,0 +1,834 @@
+#!/bin/bash
+# rustdesk-ctl: install and manage a self-hosted RustDesk server (open-source
+# hbbs/hbbr in Docker): systemd units, weekly auto-update with rollback,
+# watchdog, health status and key rotation.
+# https://github.com/civisrom/rustdesk-server-setup
+
+set -euo pipefail
+umask 077
+
+readonly CTL_VERSION="1.0.0"
+readonly RUSTDESK_DIR="/opt/rustdesk"
+readonly DATA_DIR="${RUSTDESK_DIR}/data"
+readonly BACKUP_ROOT="${RUSTDESK_DIR}/key-backups"
+readonly ENV_FILE="${RUSTDESK_DIR}/.env"
+# Root-only directory: in the world-writable system lock directory a local
+# user could pre-create the file and block every update.
+readonly LOCK_FILE="${RUSTDESK_DIR}/.update.lock"
+readonly WATCHDOG_STATE="${RUSTDESK_DIR}/.watchdog-restarts"
+readonly CTL_PATH="/usr/local/sbin/rustdesk-ctl"
+readonly UNIT_DIR="/etc/systemd/system"
+readonly DOCKER_CONFIG_DIR="/etc/docker"
+# Left behind by the RustDesk option of debian-ubuntu-setup.
+readonly LEGACY_UPDATER="/usr/local/sbin/rustdesk-safe-update.sh"
+readonly LEGACY_LOCK="/run/lock/rustdesk-update.lock"
+readonly TIMER_STAMP_DIR="/var/lib/systemd/timers"
+readonly COMPOSE_PROJECT="rustdesk"
+readonly IMAGE_REPOSITORY="rustdesk/rustdesk-server"
+readonly DOCKER_KEY_SHA256="1500c1f56fa9e26b9b8f42452a553675796ade0807cdce11975eb98170b3a570"
+readonly SERVICES=(hbbs hbbr)
+readonly TCP_PORTS=(21115 21116 21117)
+readonly UDP_PORTS=(21116)
+readonly UNITS=(rustdesk-compose.service rustdesk-update.service rustdesk-update.timer
+                rustdesk-watchdog.service rustdesk-watchdog.timer)
+readonly WAIT_SECONDS=30
+# The image has no healthcheck, so `docker compose up --wait` reports a
+# crash-looping container as healthy. Check the containers after a pause.
+readonly SETTLE_SECONDS=15
+readonly WATCHDOG_RECHECK_SECONDS=20
+readonly WATCHDOG_MAX_RESTARTS=3
+readonly WATCHDOG_WINDOW_SECONDS=3600
+SOURCE_DIR=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)
+readonly SOURCE_DIR
+
+usage() {
+    cat <<'EOF'
+Usage: rustdesk-ctl <command> [options]
+
+Setup (run from a checkout of the repository):
+  install [--install-docker] [--no-auto-update] [--no-watchdog]
+                     Install or upgrade the server in /opt/rustdesk. An existing
+                     installation keeps its key pair and image.
+                     --install-docker installs Docker CE when it is missing and
+                     disables its iptables/ip6tables management (daemon.json).
+  uninstall [--purge] [--yes]
+                     Remove everything RustDesk installed: containers, every
+                     rustdesk-server image, systemd units with their drop-ins
+                     and timer stamps, rustdesk-ctl and leftovers of the
+                     debian-ubuntu-setup version. The key pair in
+                     /opt/rustdesk/data is kept unless --purge is given;
+                     --purge deletes /opt/rustdesk completely.
+
+Daily use:
+  status             Check services, containers, ports, the loaded key, the
+                     watchdog and recent errors. Exit code 1 on a failure.
+  version            Pinned image, running hbbs/hbbr versions, newer image.
+  update             Update to the latest image now (rolls back on failure).
+  logs [LINES]       Last log lines of hbbs and hbbr (default 100).
+  key show           Public key for the "Key" field of RustDesk clients.
+  key rotate [--yes] Generate a new key pair; the old one is kept in
+                     /opt/rustdesk/key-backups/. Clients need the new key.
+
+Internal (systemd):
+  watchdog           Restart rustdesk-compose.service if hbbs/hbbr are down.
+EOF
+}
+
+say() { printf '%s\n' "$*"; }
+die() { printf 'rustdesk-ctl: %s\n' "$*" >&2; exit 1; }
+
+# Log lines may carry client-supplied text: drop terminal control characters.
+sanitize() { LC_ALL=C tr -cd '[:print:]\n'; }
+
+require_root() { [ "$(id -u)" -eq 0 ] || die "run as root"; }
+
+require_docker() {
+    command -v docker >/dev/null 2>&1 ||
+        die "docker is not installed (rustdesk-ctl install --install-docker installs it)"
+    docker compose version >/dev/null 2>&1 ||
+        die "the Docker Compose v2 plugin is missing (package docker-compose-plugin)"
+    docker info >/dev/null 2>&1 || die "the Docker daemon is not running"
+}
+
+require_buildx() {
+    docker buildx version >/dev/null 2>&1 ||
+        die "the Docker buildx plugin is missing (package docker-buildx-plugin)"
+}
+
+require_installed() {
+    [ -f "${RUSTDESK_DIR}/docker-compose.yml" ] ||
+        die "RustDesk is not installed (${RUSTDESK_DIR}/docker-compose.yml is missing)"
+    cd "$RUSTDESK_DIR"
+}
+
+take_lock() {
+    exec 9>"$LOCK_FILE"
+    flock -n 9
+}
+
+confirm() {
+    local answer
+    [ -t 0 ] || die "refusing to $2 without a terminal; use --yes"
+    printf '%s\n' "$1"
+    read -r -p "Type 'yes' to continue: " answer
+    [ "$answer" = yes ] || die "aborted"
+}
+
+read_public_key() {
+    local key
+    [ -s "${DATA_DIR}/id_ed25519.pub" ] || return 1
+    key=$(< "${DATA_DIR}/id_ed25519.pub")
+    printf '%s\n' "$key"
+}
+
+pinned_image() {
+    local images
+    images=$(docker compose config --images)
+    printf '%s\n' "${images%%$'\n'*}"
+}
+
+latest_digest() {
+    local digest
+    digest=$(docker buildx imagetools inspect "${IMAGE_REPOSITORY}:latest" \
+        --format '{{json .Manifest.Digest}}' | tr -d '"[:space:]') || return 1
+    [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || return 1
+    printf '%s\n' "$digest"
+}
+
+# hbbs and hbbr log "Key: <public key>" once they have loaded the key file.
+# Not `grep -q`: it exits at the first match near the top of a log that can
+# be 30 MB, and with pipefail the writer's SIGPIPE turns a match into a failure.
+has_loaded_key() {
+    docker compose logs --no-log-prefix "$1" 2>/dev/null | grep -F "Key: $2" >/dev/null
+}
+
+# $1 = t (TCP) or u (UDP), $2 = port
+listening() {
+    [ -n "$(ss -Hl"$1"n "sport = :$2" 2>/dev/null)" ]
+}
+
+wait_for_loaded_key() {
+    local i
+    for ((i = 0; i < WAIT_SECONDS; i++)); do
+        has_loaded_key "$1" "$2" && return 0
+        sleep 1
+    done
+    echo "rustdesk-ctl: $1 did not load the expected key" >&2
+    return 1
+}
+
+# Prints one line per problem; prints nothing when hbbs/hbbr look healthy.
+health_problems() {
+    local service state port
+    for service in "${SERVICES[@]}"; do
+        state=$(docker inspect -f '{{.State.Status}}' "$service" 2>/dev/null) || state="missing"
+        [ "$state" = running ] || printf '%s: %s\n' "$service" "$state"
+    done
+    for port in "${TCP_PORTS[@]}"; do
+        listening t "$port" || printf 'tcp/%s: not listening\n' "$port"
+    done
+    for port in "${UDP_PORTS[@]}"; do
+        listening u "$port" || printf 'udp/%s: not listening\n' "$port"
+    done
+}
+
+# $1 = "recreated": the containers were just recreated, so any restart counts.
+check_services() {
+    local problems restarts
+    sleep "$SETTLE_SECONDS"
+    problems=$(health_problems)
+    if [ -n "$problems" ]; then
+        printf 'rustdesk-ctl: service check failed:\n%s\n' "$problems" >&2
+        return 1
+    fi
+    if [ "${1:-}" = recreated ]; then
+        restarts=$(docker inspect -f '{{.RestartCount}}' "${SERVICES[@]}") || return 1
+        if [ "$restarts" != $'0\n0' ]; then
+            echo "rustdesk-ctl: service check failed: hbbs/hbbr restarted after start" >&2
+            return 1
+        fi
+    fi
+}
+
+# hbbr creates its own pair 300 ms after start if the key file is still
+# missing, so let hbbs create the pair alone before hbbr starts.
+generate_key() {
+    local i
+    rm -f -- "${DATA_DIR}/id_ed25519.pub"
+    docker compose up -d --wait --no-deps hbbs
+    for ((i = 0; i < WAIT_SECONDS; i++)); do
+        [ -s "${DATA_DIR}/id_ed25519.pub" ] && break
+        sleep 1
+    done
+    [ -s "${DATA_DIR}/id_ed25519" ] && [ -s "${DATA_DIR}/id_ed25519.pub" ] || {
+        echo "rustdesk-ctl: hbbs did not create a key pair" >&2
+        return 1
+    }
+    # hbbs 1.1.16 creates the private key with mode 0644.
+    chmod 0600 "${DATA_DIR}/id_ed25519"
+}
+
+install_file() {
+    local source="$1" target="$2" mode="$3" temporary
+    temporary=$(mktemp "${target}.new.XXXXXX")
+    if ! install -m "$mode" -o root -g root "$source" "$temporary"; then
+        rm -f -- "$temporary"
+        return 1
+    fi
+    mv -f -- "$temporary" "$target"
+}
+
+unit_state() { systemctl show -p "$1" --value "$2" 2>/dev/null || true; }
+
+# ---------------------------------------------------------------- install
+
+install_docker() {
+    local os codename arch key
+    # shellcheck disable=SC1091
+    . /etc/os-release
+    os="${ID:-}"
+    codename="${VERSION_CODENAME:-}"
+    case "$os" in
+        debian|ubuntu) ;;
+        *) die "--install-docker supports Debian and Ubuntu only (found: ${os:-unknown})" ;;
+    esac
+    [ -n "$codename" ] || die "cannot determine the release codename"
+    arch=$(dpkg --print-architecture)
+
+    say "Installing Docker from the official repository download.docker.com..."
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update
+    apt-get install -y ca-certificates curl
+    key=$(mktemp)
+    if ! curl -fsSL --proto '=https' --tlsv1.2 "https://download.docker.com/linux/${os}/gpg" -o "$key"; then
+        rm -f -- "$key"
+        die "failed to download the Docker repository key"
+    fi
+    if [ "$(sha256sum "$key" | cut -d' ' -f1)" != "$DOCKER_KEY_SHA256" ]; then
+        rm -f -- "$key"
+        die "Docker repository key SHA256 mismatch"
+    fi
+    install -d -m 0755 /etc/apt/keyrings
+    install -m 0644 -o root -g root "$key" /etc/apt/keyrings/docker.asc
+    rm -f -- "$key"
+    cat > /etc/apt/sources.list.d/docker.sources <<EOF
+Types: deb
+URIs: https://download.docker.com/linux/${os}
+Suites: ${codename}
+Components: stable
+Architectures: ${arch}
+Signed-By: /etc/apt/keyrings/docker.asc
+EOF
+    chmod 0644 /etc/apt/sources.list.d/docker.sources
+    apt-get update
+    apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+    systemctl enable docker.service
+    disable_docker_firewall
+}
+
+# Docker must not manage iptables/ip6tables: the host firewall (nftables) owns
+# the rules. hbbs/hbbr use host networking and need no Docker NAT.
+disable_docker_firewall() {
+    local config="${DOCKER_CONFIG_DIR}/daemon.json" backup="" temporary
+    install -d -m 0755 "$DOCKER_CONFIG_DIR"
+    temporary=$(mktemp "${config}.new.XXXXXX")
+    if [ -f "$config" ]; then
+        backup="${config}.backup.$(date +%Y%m%d-%H%M%S)"
+        cp -p -- "$config" "$backup"
+        # Merge, never replace: the file may hold other daemon settings.
+        if ! command -v python3 >/dev/null 2>&1; then
+            rm -f -- "$temporary"
+            die "python3 is required to merge the existing ${config}; it was left unchanged"
+        fi
+        if ! python3 -I - "$config" "$temporary" <<'EOF'
+import json
+import sys
+
+source, destination = sys.argv[1:]
+with open(source, encoding="utf-8") as stream:
+    config = json.load(stream)
+if not isinstance(config, dict):
+    raise SystemExit("top-level Docker configuration must be a JSON object")
+config.update({"iptables": False, "ip6tables": False, "userland-proxy": False})
+with open(destination, "w", encoding="utf-8") as stream:
+    json.dump(config, stream, indent=2)
+    stream.write("\n")
+EOF
+        then
+            rm -f -- "$temporary"
+            die "${config} is not valid JSON; it was left unchanged"
+        fi
+    else
+        printf '{\n  "iptables": false,\n  "ip6tables": false,\n  "userland-proxy": false\n}\n' > "$temporary"
+    fi
+    chmod 0600 "$temporary"
+    mv -f -- "$temporary" "$config"
+    if ! systemctl restart docker.service || ! docker info >/dev/null 2>&1; then
+        if [ -n "$backup" ]; then
+            cp -p -- "$backup" "$config"
+        else
+            rm -f -- "$config"
+        fi
+        systemctl restart docker.service || true
+        die "Docker did not start with iptables disabled; the previous configuration was restored"
+    fi
+    say "Docker iptables/ip6tables management disabled (${config}${backup:+, backup: ${backup}})"
+}
+
+cmd_install() {
+    local install_docker_flag=false auto_update=true watchdog=true unit key timer
+    for arg in "$@"; do
+        case "$arg" in
+            --install-docker) install_docker_flag=true ;;
+            --no-auto-update) auto_update=false ;;
+            --no-watchdog) watchdog=false ;;
+            *) usage >&2; exit 2 ;;
+        esac
+    done
+    require_root
+    [ -d /run/systemd/system ] || die "systemd is required"
+    [ -f "${SOURCE_DIR}/files/docker-compose.yml" ] ||
+        die "run install from a checkout of the repository (files/ not found next to ${SOURCE_DIR}/rustdesk-ctl)"
+    if [ "$install_docker_flag" = true ]; then
+        if command -v docker >/dev/null 2>&1; then
+            say "Docker is already installed; ${DOCKER_CONFIG_DIR}/daemon.json is left as it is"
+        else
+            install_docker
+        fi
+    fi
+    require_docker
+    require_buildx
+    command -v ss >/dev/null 2>&1 || die "ss (package iproute2) is required"
+
+    install -d -m 0755 -o root -g root "$RUSTDESK_DIR"
+    install -d -m 0700 -o root -g root "$DATA_DIR"
+    chmod 0700 "$DATA_DIR"
+    [ ! -f "${DATA_DIR}/id_ed25519" ] || chmod 0600 "${DATA_DIR}/id_ed25519"
+    cd "$RUSTDESK_DIR"
+    take_lock || die "a RustDesk update, key rotation or watchdog restart is running; retry later"
+
+    install_file "${SOURCE_DIR}/files/docker-compose.yml" "${RUSTDESK_DIR}/docker-compose.yml" 0644
+    docker compose config -q
+    for unit in "${UNITS[@]}"; do
+        install_file "${SOURCE_DIR}/files/${unit}" "${UNIT_DIR}/${unit}" 0644
+    done
+    install_file "${SOURCE_DIR}/rustdesk-ctl" "$CTL_PATH" 0755
+    rm -f -- "$LEGACY_UPDATER"
+    # The old rustdesk-update.service had an [Install] section: never start
+    # updates or watchdog runs at boot through a stale link.
+    rm -f -- "${UNIT_DIR}"/*.wants/rustdesk-update.service "${UNIT_DIR}"/*.wants/rustdesk-watchdog.service
+    systemctl daemon-reload
+
+    if [ ! -s "${DATA_DIR}/id_ed25519" ]; then
+        say "Generating the server key pair..."
+        generate_key
+    fi
+    systemctl enable rustdesk-compose.service
+    if [ "$(unit_state ActiveState rustdesk-compose.service)" = active ]; then
+        # Recreates the containers only if the image or configuration changed.
+        docker compose up -d --wait --remove-orphans
+    else
+        systemctl start rustdesk-compose.service
+    fi
+    check_services || die "hbbs/hbbr are not healthy; see: rustdesk-ctl logs"
+    key=$(read_public_key) || die "no public key in ${DATA_DIR}"
+    for timer in update watchdog; do
+        if { [ "$timer" = update ] && [ "$auto_update" = true ]; } ||
+           { [ "$timer" = watchdog ] && [ "$watchdog" = true ]; }; then
+            systemctl enable --now "rustdesk-${timer}.timer"
+        else
+            systemctl disable --now "rustdesk-${timer}.timer" 2>/dev/null || true
+        fi
+    done
+
+    say ""
+    say "RustDesk server is installed and running ($(pinned_image))."
+    say "Open TCP 21115-21117 and UDP 21116 in the firewall. Port 21114 is not used."
+    say "Client settings: ID server = this host, Key ="
+    say "$key"
+    say "Check it any time with: rustdesk-ctl status"
+}
+
+# -------------------------------------------------------------- uninstall
+
+# Containers of the compose project or named hbbs/hbbr, and every image of
+# the rustdesk-server repository (older digests too).
+remove_docker_objects() {
+    local -a ids=()
+    mapfile -t ids < <({
+        docker ps -aq --filter "label=com.docker.compose.project=${COMPOSE_PROJECT}"
+        docker ps -aq --filter 'name=^hbbs$'
+        docker ps -aq --filter 'name=^hbbr$'
+    } 2>/dev/null | sort -u)
+    [ "${#ids[@]}" -eq 0 ] || docker rm -f "${ids[@]}" >/dev/null 2>&1 || true
+    mapfile -t ids < <(docker image ls -q "$IMAGE_REPOSITORY" 2>/dev/null | sort -u)
+    [ "${#ids[@]}" -eq 0 ] || docker image rm -f "${ids[@]}" >/dev/null 2>&1 || true
+}
+
+cmd_uninstall() {
+    local purge=false assume_yes=false arg unit link
+    for arg in "$@"; do
+        case "$arg" in
+            --purge) purge=true ;;
+            --yes) assume_yes=true ;;
+            *) usage >&2; exit 2 ;;
+        esac
+    done
+    require_root
+    if [ "$assume_yes" != true ]; then
+        if [ "$purge" = true ]; then
+            confirm "This removes RustDesk and DELETES its key pair: clients will need a new key after a reinstall." "uninstall"
+        else
+            confirm "This removes RustDesk; the key pair stays in ${DATA_DIR}." "uninstall"
+        fi
+    fi
+    if [ -d "$RUSTDESK_DIR" ]; then
+        cd "$RUSTDESK_DIR"
+        take_lock || die "a RustDesk update, key rotation or watchdog restart is running; retry later"
+    fi
+
+    for unit in rustdesk-watchdog.timer rustdesk-update.timer rustdesk-watchdog.service \
+                rustdesk-update.service rustdesk-compose.service; do
+        systemctl disable --now "$unit" >/dev/null 2>&1 || true
+    done
+    if command -v docker >/dev/null 2>&1; then
+        if [ -f "${RUSTDESK_DIR}/docker-compose.yml" ]; then
+            # Usually already done by stopping rustdesk-compose.service.
+            docker compose down --remove-orphans >/dev/null 2>&1 || true
+        fi
+        remove_docker_objects
+    fi
+    for unit in "${UNITS[@]}"; do
+        rm -rf -- "${UNIT_DIR:?}/${unit}" "${UNIT_DIR:?}/${unit}.d"
+        rm -f -- "${TIMER_STAMP_DIR}/stamp-${unit}"
+    done
+    # Links left when a unit file was removed without `systemctl disable`.
+    for link in "${UNIT_DIR}"/*.wants/rustdesk-*; do
+        [ ! -L "$link" ] || rm -f -- "$link"
+    done
+    systemctl daemon-reload
+    systemctl reset-failed "${UNITS[@]}" >/dev/null 2>&1 || true
+    rm -f -- "$LEGACY_UPDATER" "$LEGACY_LOCK" "$CTL_PATH"
+
+    if [ "$purge" = true ]; then
+        rm -rf -- "$RUSTDESK_DIR"
+        say "RustDesk removed completely, including its key pair."
+    elif [ -d "$RUSTDESK_DIR" ]; then
+        find "$RUSTDESK_DIR" -mindepth 1 -maxdepth 1 ! -name data ! -name key-backups -exec rm -rf -- {} +
+        say "RustDesk removed. The key pair is kept in ${DATA_DIR}; a new install reuses it."
+    else
+        say "RustDesk removed."
+    fi
+}
+
+# ----------------------------------------------------------------- update
+
+current_image=""
+env_backup=""
+env_tmp=""
+env_changed=false
+keep_backup=false
+
+rollback_update() {
+    echo "rustdesk-ctl: update failed; restoring the previous image" >&2
+    if [ -s "$env_backup" ]; then
+        cp -- "$env_backup" "$ENV_FILE" || return 1
+    else
+        printf 'RUSTDESK_IMAGE=%s\n' "$current_image" > "$ENV_FILE" || return 1
+    fi
+    chmod 0600 "$ENV_FILE" || return 1
+    docker compose up -d --wait --remove-orphans || return 1
+    check_services recreated
+}
+
+finish_update() {
+    local result=$?
+    trap - EXIT INT TERM
+    if [ "$result" -ne 0 ] && [ "$env_changed" = true ]; then
+        if ! rollback_update; then
+            echo "rustdesk-ctl: rollback failed; previous settings kept at ${env_backup}" >&2
+            keep_backup=true
+        fi
+    fi
+    [ -z "$env_tmp" ] || rm -f -- "$env_tmp"
+    if [ -n "$env_backup" ] && [ "$keep_backup" != true ]; then
+        rm -f -- "$env_backup"
+    fi
+    exit "$result"
+}
+
+cmd_update() {
+    local current_digest latest new_image grep_status
+    require_root
+    require_docker
+    require_buildx
+    require_installed
+    if ! take_lock; then
+        echo "rustdesk-ctl: a RustDesk update, key rotation or watchdog restart is already running" >&2
+        exit 75
+    fi
+
+    current_image=$(pinned_image)
+    current_digest="${current_image##*@}"
+    latest=$(latest_digest) || die "cannot read the latest ${IMAGE_REPOSITORY} digest from Docker Hub"
+    if [ "$latest" = "$current_digest" ]; then
+        say "RustDesk already uses the latest image: ${latest}"
+        return 0
+    fi
+    new_image="${IMAGE_REPOSITORY}@${latest}"
+
+    env_backup=$(mktemp "${RUSTDESK_DIR}/.env.backup.XXXXXX")
+    trap finish_update EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    if [ -f "$ENV_FILE" ]; then
+        cp -- "$ENV_FILE" "$env_backup"
+    fi
+    env_tmp=$(mktemp "${RUSTDESK_DIR}/.env.new.XXXXXX")
+    grep -v '^RUSTDESK_IMAGE=' "$env_backup" > "$env_tmp" || {
+        grep_status=$?
+        [ "$grep_status" -eq 1 ] || exit "$grep_status"
+    }
+    printf 'RUSTDESK_IMAGE=%s\n' "$new_image" >> "$env_tmp"
+    chmod 0600 "$env_tmp"
+    env_changed=true
+    mv -f -- "$env_tmp" "$ENV_FILE"
+    env_tmp=""
+
+    docker compose pull
+    docker compose up -d --wait --remove-orphans
+    check_services recreated
+    env_changed=false
+    docker image rm "$current_image" >/dev/null 2>&1 || true
+    say "RustDesk updated: ${current_digest} -> ${latest}"
+}
+
+# --------------------------------------------------------------- watchdog
+
+cmd_watchdog() {
+    local problems now cutoff count line
+    local -a recent=()
+    require_root
+    require_installed
+    if ! take_lock; then
+        say "Update or key rotation in progress; skipping this check"
+        return 0
+    fi
+    # A stopped service is the administrator's choice; a failed start is
+    # retried by the unit itself (Restart=on-failure).
+    if [ "$(unit_state ActiveState rustdesk-compose.service)" != active ]; then
+        return 0
+    fi
+    problems=$(health_problems)
+    [ -n "$problems" ] || return 0
+    sleep "$WATCHDOG_RECHECK_SECONDS"
+    problems=$(health_problems)
+    [ -n "$problems" ] || return 0
+    problems=$(printf '%s' "$problems" | tr '\n' ';')
+
+    now=$(date +%s)
+    cutoff=$((now - WATCHDOG_WINDOW_SECONDS))
+    if [ -f "$WATCHDOG_STATE" ]; then
+        while read -r line; do
+            [[ "$line" =~ ^[0-9]+$ ]] && [ "$line" -gt "$cutoff" ] && recent+=("$line")
+        done < "$WATCHDOG_STATE"
+    fi
+    count=${#recent[@]}
+    if [ "$count" -ge "$WATCHDOG_MAX_RESTARTS" ]; then
+        echo "rustdesk-ctl: hbbs/hbbr unhealthy (${problems}); ${count} restarts in the last hour, not restarting again. See: rustdesk-ctl logs" >&2
+        return 1
+    fi
+    recent+=("$now")
+    printf '%s\n' "${recent[@]}" > "$WATCHDOG_STATE"
+    echo "rustdesk-ctl: hbbs/hbbr unhealthy (${problems}); restarting rustdesk-compose.service" >&2
+    systemctl restart rustdesk-compose.service
+    if check_services; then
+        echo "rustdesk-ctl: hbbs/hbbr recovered after the restart" >&2
+    else
+        return 1
+    fi
+}
+
+# ----------------------------------------------------------------- status
+
+failures=0
+warnings=0
+ok()   { printf '  [ OK ] %s\n' "$*"; }
+warn() { printf '  [WARN] %s\n' "$*"; warnings=$((warnings + 1)); }
+fail() { printf '  [FAIL] %s\n' "$*"; failures=$((failures + 1)); }
+
+report_timer() {
+    local name="$1" label="$2" result last
+    if ! systemctl is-enabled --quiet "rustdesk-${name}.timer" 2>/dev/null; then
+        warn "rustdesk-${name}.timer is not enabled (no ${label})"
+        return
+    fi
+    ok "rustdesk-${name}.timer is enabled, next run: $(unit_state NextElapseUSecRealtime "rustdesk-${name}.timer")"
+    result=$(unit_state Result "rustdesk-${name}.service")
+    last=$(unit_state ExecMainExitTimestamp "rustdesk-${name}.service")
+    if [ -z "$last" ] || [ "$last" = n/a ]; then
+        ok "${label}: has not run since boot"
+    elif [ "$result" = success ]; then
+        ok "${label}: last run ${last}: success"
+    else
+        warn "${label}: last run ${last}: ${result:-unknown} (journalctl -u rustdesk-${name}.service)"
+    fi
+}
+
+cmd_status() {
+    local service state restarts started key port mode errors line count=0 cutoff
+    require_root
+    require_docker
+    require_installed
+
+    echo "systemd:"
+    if systemctl is-enabled --quiet rustdesk-compose.service 2>/dev/null; then
+        ok "rustdesk-compose.service is enabled"
+    else
+        fail "rustdesk-compose.service is not enabled"
+    fi
+    state=$(unit_state ActiveState rustdesk-compose.service)
+    if [ "$state" = active ]; then
+        ok "rustdesk-compose.service is active"
+    else
+        fail "rustdesk-compose.service is ${state:-unknown} (journalctl -u rustdesk-compose.service)"
+    fi
+    report_timer update "auto-update"
+    report_timer watchdog "watchdog"
+    if [ -f "$WATCHDOG_STATE" ]; then
+        cutoff=$(( $(date +%s) - WATCHDOG_WINDOW_SECONDS ))
+        while read -r line; do
+            [[ "$line" =~ ^[0-9]+$ ]] && [ "$line" -gt "$cutoff" ] && count=$((count + 1))
+        done < "$WATCHDOG_STATE"
+        [ "$count" -eq 0 ] || warn "watchdog restarted the server ${count} time(s) in the last hour"
+    fi
+
+    echo "containers:"
+    for service in "${SERVICES[@]}"; do
+        if ! state=$(docker inspect -f '{{.State.Status}} {{.RestartCount}} {{.State.StartedAt}}' "$service" 2>/dev/null); then
+            fail "${service}: container does not exist"
+            continue
+        fi
+        read -r state restarts started <<< "$state"
+        if [ "$state" != running ]; then
+            fail "${service}: ${state}"
+        elif [ "$restarts" -gt 0 ]; then
+            warn "${service}: running, but Docker restarted it ${restarts} time(s); started ${started}"
+        else
+            ok "${service}: running since ${started}"
+        fi
+    done
+
+    echo "ports:"
+    for port in "${TCP_PORTS[@]}"; do
+        if listening t "$port"; then ok "tcp/${port} listening"; else fail "tcp/${port} not listening"; fi
+    done
+    for port in "${UDP_PORTS[@]}"; do
+        if listening u "$port"; then ok "udp/${port} listening"; else fail "udp/${port} not listening"; fi
+    done
+
+    echo "key:"
+    if key=$(read_public_key); then
+        ok "public key: ${key}"
+        for service in "${SERVICES[@]}"; do
+            if has_loaded_key "$service" "$key"; then
+                ok "${service} uses this key"
+            else
+                fail "${service} did not log this key (systemctl restart rustdesk-compose.service)"
+            fi
+        done
+    else
+        fail "no public key in ${DATA_DIR}"
+    fi
+    mode=$(stat -c %a "$DATA_DIR" 2>/dev/null || echo "?")
+    if [ "$mode" = 700 ]; then
+        ok "${DATA_DIR} is private (700)"
+    else
+        warn "${DATA_DIR} has mode ${mode}; other users can read the private key (chmod 700 ${DATA_DIR})"
+    fi
+
+    echo "logs (last 24 h):"
+    errors=$(docker compose logs --since 24h --no-log-prefix 2>&1 | grep -Ei 'error|panic|fatal' || true)
+    if [ -z "$errors" ]; then
+        ok "no errors"
+    else
+        warn "$(printf '%s\n' "$errors" | wc -l) error line(s); latest:"
+        printf '%s\n' "$errors" | tail -n 5 | sanitize | sed 's/^/         /'
+    fi
+
+    echo
+    if [ "$failures" -gt 0 ]; then
+        echo "Result: ${failures} failure(s), ${warnings} warning(s)"
+        return 1
+    fi
+    echo "Result: OK, ${warnings} warning(s)"
+}
+
+# ---------------------------------------------------------------- version
+
+cmd_version() {
+    local image latest service
+    require_root
+    require_docker
+    require_installed
+    image=$(pinned_image)
+    echo "rustdesk-ctl:  ${CTL_VERSION}"
+    echo "Pinned image:  ${image}"
+    for service in "${SERVICES[@]}"; do
+        printf '%-14s ' "${service}:"
+        docker compose exec -T "$service" "$service" --version 2>/dev/null || echo "not running"
+    done
+    if docker buildx version >/dev/null 2>&1 && latest=$(latest_digest 2>/dev/null); then
+        echo "Latest image:  ${IMAGE_REPOSITORY}@${latest}"
+        if [ "${image##*@}" = "$latest" ]; then
+            echo "Update:        not needed, the latest image is in use"
+        else
+            echo "Update:        available (rustdesk-ctl update)"
+        fi
+    else
+        echo "Latest image:  unknown (Docker Hub is unreachable)"
+    fi
+}
+
+cmd_logs() {
+    local lines="${1:-100}"
+    [[ "$lines" =~ ^[0-9]{1,6}$ ]] || { usage >&2; exit 2; }
+    require_root
+    require_docker
+    require_installed
+    docker compose logs --tail "$lines" 2>&1 | sanitize
+}
+
+# -------------------------------------------------------------------- key
+
+backup_dir=""
+keys_moved=false
+
+restore_key() {
+    echo "rustdesk-ctl: rotation failed; restoring the previous key" >&2
+    docker compose down || true
+    rm -f -- "${DATA_DIR}/id_ed25519" "${DATA_DIR}/id_ed25519.pub"
+    mv -f -- "${backup_dir}/id_ed25519" "${backup_dir}/id_ed25519.pub" "${DATA_DIR}/" || return 1
+    rmdir -- "$backup_dir" || true
+    docker compose up -d --wait
+}
+
+finish_rotate() {
+    local result=$?
+    trap - EXIT INT TERM
+    if [ "$result" -ne 0 ] && [ "$keys_moved" = true ]; then
+        restore_key || echo "rustdesk-ctl: restore failed; the previous key is in ${backup_dir}" >&2
+    fi
+    exit "$result"
+}
+
+cmd_key_show() {
+    require_root
+    read_public_key || die "no public key in ${DATA_DIR}; is RustDesk installed?"
+}
+
+cmd_key_rotate() {
+    local assume_yes="$1" old_key new_key
+    require_root
+    require_docker
+    require_installed
+    take_lock || die "a RustDesk update, key rotation or watchdog restart is already running"
+    [ -s "${DATA_DIR}/id_ed25519" ] || die "no private key in ${DATA_DIR}; nothing to rotate"
+    old_key=$(read_public_key) || die "no public key in ${DATA_DIR}"
+    if [ "$assume_yes" != true ]; then
+        confirm "Current public key: ${old_key}
+Rotation disconnects every client until it is given the new key." "rotate the key"
+    fi
+
+    install -d -m 0700 "$BACKUP_ROOT"
+    chmod 0700 "$BACKUP_ROOT"
+    backup_dir="${BACKUP_ROOT}/$(date -u +%Y%m%dT%H%M%SZ)"
+    mkdir -m 0700 "$backup_dir" || die "backup directory ${backup_dir} already exists"
+
+    trap finish_rotate EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    docker compose down
+    keys_moved=true
+    mv -- "${DATA_DIR}/id_ed25519" "${DATA_DIR}/id_ed25519.pub" "$backup_dir/"
+    chmod 0700 "$DATA_DIR"
+    generate_key
+    new_key=$(read_public_key)
+    [ "$new_key" != "$old_key" ] || { echo "rustdesk-ctl: the new key equals the old one" >&2; exit 1; }
+    docker compose up -d --wait
+    wait_for_loaded_key hbbs "$new_key"
+    wait_for_loaded_key hbbr "$new_key"
+    keys_moved=false
+
+    say "RustDesk key rotated. Previous key pair: ${backup_dir}"
+    say "New public key (enter it in the \"Key\" field of every client):"
+    say "$new_key"
+}
+
+# ------------------------------------------------------------------- main
+
+main() {
+    local command="${1:-}"
+    [ "$#" -eq 0 ] || shift
+    case "$command" in
+        install)   cmd_install "$@" ;;
+        uninstall) cmd_uninstall "$@" ;;
+        update)    [ "$#" -eq 0 ] || { usage >&2; exit 2; }; cmd_update ;;
+        status)    [ "$#" -eq 0 ] || { usage >&2; exit 2; }; cmd_status ;;
+        version)   [ "$#" -eq 0 ] || { usage >&2; exit 2; }; cmd_version ;;
+        watchdog)  [ "$#" -eq 0 ] || { usage >&2; exit 2; }; cmd_watchdog ;;
+        logs)      [ "$#" -le 1 ] || { usage >&2; exit 2; }; cmd_logs "$@" ;;
+        key)
+            case "${1:-} ${2:-} $#" in
+                "show  1")          cmd_key_show ;;
+                "rotate  1")        cmd_key_rotate false ;;
+                "rotate --yes 2")   cmd_key_rotate true ;;
+                *)                  usage >&2; exit 2 ;;
+            esac
+            ;;
+        -h|--help|help) usage ;;
+        *) usage >&2; exit 2 ;;
+    esac
+}
+
+main "$@"
