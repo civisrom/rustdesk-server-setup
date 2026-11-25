@@ -41,5 +41,7 @@ jobs:
           # The image stays digest-pinned and both daemons require the key.
           ! grep -q 'rustdesk-server:latest' files/docker-compose.yml
           [ "$(grep -c -- ' -k _$' files/docker-compose.yml)" -eq 2 ]
-          # No lock in the world-writable system lock directory.
-          ! grep -n '/run/lock' rustdesk-ctl files/*
+          # The lock lives in root-only /opt/rustdesk, never in the world-writable
+          # system lock directory (rustdesk-ctl only deletes the legacy file there).
+          grep -qx 'readonly LOCK_FILE="${RUSTDESK_DIR}/.update.lock"' rustdesk-ctl
+          ! grep -n '/run/lock' files/*
